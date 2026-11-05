@@ -32,62 +32,88 @@
 # OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
 # POSSIBILITY OF SUCH DAMAGE.
 
-import time, uuid, logging, argparse
+"""FTP honeypot (Python 3 version of alexbredo/honeypot-ftp).
+
+Every connection, command line and disconnection is recorded as one JSON event
+(source and destination address and port, command, session id).
+
+Default behaviour matches the original: plain FTP on port 21 and implicit FTPS
+on port 990 with the certificate in keys/, Twisted's FTP replies, and no login
+ever succeeds (the original passes its password checker to FTPFactory instead
+of the Portal, so the passwd file is never consulted). --allow-login wires the
+passwd file in as the author intended; logged-in users then see pubdir
+read-only, and uploads, deletes, renames and new folders are acknowledged but
+never carried out.
+"""
+
+import argparse, json, logging, os, sys, time, uuid
 from twisted.python import filepath
 from twisted.protocols.ftp import FTPFactory, FTPRealm, FTP
 from twisted.cred.portal import Portal
 from twisted.cred.checkers import FilePasswordDB
+from twisted.cred.credentials import UsernamePassword
 from twisted.internet import reactor, ssl
-from elasticsearch import Elasticsearch
 
-# Argument parsing
 parser = argparse.ArgumentParser(description='FTP Honeypot')
-parser.add_argument('--log', choices=['screen', 'file', 'elasticsearch'], default='screen', help='Logging type')
+parser.add_argument('--log', choices=['screen', 'file', 'elasticsearch'], default='screen',
+                    help='where events go: screen (stderr), file (screen and --logfile) or elasticsearch (default: screen)')
+parser.add_argument('--logfile', default='honeypot_output.txt', help='event file for --log file, one JSON object per line')
+parser.add_argument('--es-host', default='127.0.0.1', help='Elasticsearch host for --log elasticsearch')
+parser.add_argument('--es-port', type=int, default=9200, help='Elasticsearch port')
+parser.add_argument('--es-index', default='honeypot', help='Elasticsearch index')
+parser.add_argument('--bind', default='', help='address to listen on (default: all)')
+parser.add_argument('--port', type=int, default=21, help='plain FTP port (default: 21)')
+parser.add_argument('--sslport', type=int, default=990, help='implicit FTPS port, 0 to disable (default: 990)')
+parser.add_argument('--sslkey', default='keys/smtp.private.key', help='TLS private key (default: the bundled key)')
+parser.add_argument('--sslcert', default='keys/smtp.public.key', help='TLS certificate (default: the bundled certificate)')
+parser.add_argument('--pubdir', default='pub/', help='directory shown to logged-in users')
+parser.add_argument('--passwd', default='passwd', help='user:password file used with --allow-login')
+parser.add_argument('--allow-login', action='store_true', help='accept the accounts in --passwd (the original never accepts a login)')
+parser.add_argument('--passive-ports', default='', help='passive data port range, e.g. 30000-30009 (default: any free port)')
+parser.add_argument('--banner', default='', help="greeting text after '220 ' (default: Twisted's 'Twisted <version> FTP Server')")
 parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
 args = parser.parse_args()
 
-# Configure logging
-log_level = logging.DEBUG if args.verbose else logging.INFO
-logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('honeypot_ftp')
 
+es = None
+event_file = None
 if args.log == 'file':
-    file_handler = logging.FileHandler('honeypot_output.txt')
-    logger.addHandler(file_handler)
+    event_file = open(args.logfile, 'a', buffering=1, encoding='utf-8')
 elif args.log == 'elasticsearch':
-    es_host = '127.0.0.1'
-    es_port = 9200
-    es = Elasticsearch([{'host': es_host, 'port': es_port}])
-class FTPConfig:
-    def __init__(self):
-        self.version = '0.1.0'
-        self.appname = 'honeypot_ftp'
-        self.port = 2121
-        self.sslport = 990
-        self.pubdir = 'pub/'
-        self.passwdfile = 'passwd'
-        self.sslcertprivate = 'keys/smtp.private.key'
-        self.sslcertpublic = 'keys/smtp.public.key'
-        self.enabled_handlers = {
-            'elasticsearch': True, 
-            'screen': True,
-            'file': True
-        }
-        self.elasticsearch = {
-            'host': '127.0.0.1', 
-            'port': 9200, 
-            'index': 'honeypot'
-        }
-        self.filename = 'honeypot_output.txt'
+    from elasticsearch import Elasticsearch
+    es = Elasticsearch(['http://%s:%d' % (args.es_host, args.es_port)])
 
-config = FTPConfig()
+
+def handle(data):
+    line = json.dumps(data, ensure_ascii=False)
+    logger.info('FTP Event: %s', line)
+    if event_file:
+        event_file.write(line + '\n')
+    if es is not None:
+        try:
+            es.index(index=args.es_index, body=data)
+        except Exception as e:
+            logger.error('Elasticsearch: %s', e)
+
+
+class PasswdFileChecker(FilePasswordDB):
+    """FilePasswordDB compares bytes from the file with the text user name Twisted's FTP passes on Python 3."""
+    def requestAvatarId(self, c):
+        return FilePasswordDB.requestAvatarId(self, UsernamePassword(
+            c.username.encode('utf-8') if isinstance(c.username, str) else c.username,
+            c.password.encode('utf-8') if isinstance(c.password, str) else c.password))
+
 
 class MyFTPRealm(FTPRealm):
     def __init__(self, dir):
         self.userHome = filepath.FilePath(dir)
 
     def getHomeDirectory(self, avatarId):
-        return self.userHome
+        return self.userHome  # Hack: ignore users' directories
+
 
 class SimpleFtpProtocol(FTP):
     def __init__(self):
@@ -104,71 +130,82 @@ class SimpleFtpProtocol(FTP):
         super().connectionLost(reason)
 
     def lineReceived(self, line):
-        self.__logInfo('command', line, True)
-        super().lineReceived(line)
+        self.__logInfo('command', line.decode('utf-8', 'replace') if isinstance(line, bytes) else line, True)
+        return super().lineReceived(line)
+
+    def _say(self, text):
+        return self.sendLine(text.encode('utf-8'))
+
+    # BEGIN HACKS: do not write anything to disk (remove functionality)
 
     def ftp_STOR(self, path):
-        self.sendLine('125 Data connection already open, starting transfer')
-        self.sendLine('226 Transfer Complete.')
+        self._say('125 Data connection already open, starting transfer')
+        self._say('226 Transfer Complete.')
 
     def ftp_DELE(self, path):
-        self.sendLine('250 Requested File Action Completed OK')
+        self._say('250 Requested File Action Completed OK')
 
     def ftp_RNFR(self, fromName):
-        self.sendLine('350 Requested file action pending further information.')
+        self._say('350 Requested file action pending further information.')
 
     def ftp_RNTO(self, toName):
-        self.sendLine('250 Requested File Action Completed OK')
+        self._say('250 Requested File Action Completed OK')
 
     def ftp_MKD(self, path):
-        self.sendLine('257 Folder created')
+        self._say('257 Folder created')
 
     def ftp_RMD(self, path):
-        self.sendLine('250 Requested File Action Completed OK')
+        self._say('250 Requested File Action Completed OK')
+
+    # END HACKS
 
     def __logInfo(self, type, command, successful):
-        try:
+        try:  # Hack: on connection close the socket is unavailable; remember the old address
             self.myownhost = self.transport.getHost()
         except AttributeError:
             pass
-
+        peer = self.transport.getPeer()
         data = {
-            'module': 'FTP', 
-            '@timestamp': int(time.time() * 1000),
-            'sourceIPv4Address': str(self.transport.getPeer().host), 
-            'sourceTransportPort': self.transport.getPeer().port,
+            'module': 'FTP',
+            '@timestamp': int(time.time() * 1000),  # in milliseconds
+            'sourceIPv4Address': str(peer.host),
+            'sourceTransportPort': peer.port,
             'type': type,
-            'command': command, 
-            'success': successful, 
+            'command': command,
+            'success': successful,
             'session': self.session
         }
         if self.myownhost:
             data['destinationIPv4Address'] = str(self.myownhost.host)
             data['destinationTransportPort'] = self.myownhost.port
-        if args.log == 'screen' or args.log == 'file':
-            logger.info(f"FTP Event: {data}")
-        elif args.log == 'elasticsearch':
-            es.index(index="honeypot", doc_type="event", body=data)
+        handle(data)
+
 
 try:
-    factory = FTPFactory(
-        Portal(MyFTPRealm(config.pubdir)), 
-        [FilePasswordDB(config.passwdfile)]
-    )
+    os.makedirs(args.pubdir, exist_ok=True)
+    portal = Portal(MyFTPRealm(args.pubdir))
+    if args.allow_login:
+        portal.registerChecker(PasswdFileChecker(args.passwd))
+    factory = FTPFactory(portal)
+    # The original passes its checker list as FTPFactory's second argument (userAnonymous),
+    # so 'anonymous' is treated as an ordinary account; kept for fidelity.
+    factory.userAnonymous = [FilePasswordDB(args.passwd)]
     factory.protocol = SimpleFtpProtocol
-    reactor.listenTCP(config.port, factory)
-    if args.log == 'elasticsearch':
-        reactor.listenSSL(
-            config.sslport, 
-            factory, 
-            ssl.DefaultOpenSSLContextFactory(
-                config.sslcertprivate, 
-                config.sslcertpublic
-            ))
-    logger.info(f'Server listening on Port {config.port} (Plain) and on {config.sslport} (SSL).')
+    if args.banner:
+        factory.welcomeMessage = args.banner
+    if args.passive_ports:
+        lo, hi = (int(x) for x in args.passive_ports.split('-'))
+        factory.passivePortRange = range(lo, hi + 1)
+    reactor.listenTCP(args.port, factory, interface=args.bind)
+    if args.sslport:
+        reactor.listenSSL(args.sslport, factory,
+                          ssl.DefaultOpenSSLContextFactory(args.sslkey, args.sslcert),
+                          interface=args.bind)
+    logger.info('Server listening on Port %s (Plain) and on %s (SSL). Logins %s.', args.port,
+                args.sslport or 'none', 'accepted from %s' % args.passwd if args.allow_login else 'never accepted')
     reactor.run()
 except Exception as e:
     logger.error(str(e))
-    exit(-1)
+    sys.exit(-1)
 
 logger.info('Server shutdown.')
